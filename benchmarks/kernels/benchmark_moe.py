@@ -621,6 +621,14 @@ def main(args: argparse.Namespace):
         topk = config.thinker_config.text_config.num_experts_per_tok
         intermediate_size = config.thinker_config.text_config.moe_intermediate_size
         hidden_size = config.thinker_config.text_config.hidden_size
+    ### COHERE START
+    elif config.architectures[0] == "Cohere2MoeForCausalLM":
+        E = config.num_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        hidden_size = config.hidden_size
+    ### COHERE END
     else:
         # Support for llama4
         config = config.get_text_config()
@@ -662,6 +670,7 @@ def main(args: argparse.Namespace):
             2048,
             3072,
             4096,
+            8192
         ]
     else:
         batch_sizes = args.batch_size
