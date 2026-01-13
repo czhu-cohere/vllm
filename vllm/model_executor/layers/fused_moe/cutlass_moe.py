@@ -53,8 +53,14 @@ def run_cutlass_moe_fp8(
     use_batched_format: bool,
     topk_weights: torch.Tensor | None,
 ):
-    a1q = hidden_states
+    # TODO(czhu): break to debug
+    if hidden_states.device.index == 1:
+        __import__('fpdb').ForkedPdb().set_trace()
+        print('breakpoint')
 
+    a1q = hidden_states
+    # if a1q.device.index == 0:
+    #     print(f"[conway-log] {a1q.shape=}")
     assert w1_scale is not None
     assert w2_scale is not None
     assert w1.dtype == torch.float8_e4m3fn
@@ -173,6 +179,13 @@ def run_cutlass_moe_fp8(
 
         num_expert = global_num_experts if expert_map is None else expert_map.size(0)
         # permuted a1q reuses workspace2
+        # log stuff before and after
+        # if a1q.device.index == 1:
+        #     print(f"[conway-log] before permute {a1q.shape=}")
+        #     print(f"[conway-log] before permute {topk_ids.shape=}")
+        #     print(f"[conway-log] before permute {num_expert=}")
+        #     print(f"[conway-log] before permute {local_E=}")
+
         a1q, a1q_scale, expert_offsets, inv_perm, _ = moe_permute(
             a1q,
             a1q_scale,
@@ -187,6 +200,11 @@ def run_cutlass_moe_fp8(
         ops.get_cutlass_moe_mm_problem_sizes(
             local_topk_ids, problem_sizes1, problem_sizes2, global_num_experts, N, K
         )
+        # if a1q.device.index == 1:
+        #     print(f"[conway-log] after permute {a1q.shape=}")
+        #     print(f"[conway-log] after permute {expert_offsets=}")
+        #     print(f"[conway-log] after permute {inv_perm=}, {inv_perm.shape=}")
+            # print(f"[conway-log] after permute {problem_sizes1=}")
 
     if not per_act_token and (expert_map is not None or use_batched_format):
         # this is necessary to avoid imprecise scale calculation caused by
@@ -194,6 +212,12 @@ def run_cutlass_moe_fp8(
         # this rank handles only partial tokens, or when it is batched .
         mm1_out.fill_(0)
 
+    # print rank 0
+    # if problem_sizes1.device.index == 0:
+    # first 64 nonzero when EP4
+    #     print(f"[conway-log] {problem_sizes1=}")
+    # if a1q.device.index == 0:
+    #     print(f"[conway-log] after permute {a1q.shape=}")
     ops.cutlass_moe_mm(
         mm1_out,
         a1q,
@@ -209,12 +233,25 @@ def run_cutlass_moe_fp8(
         per_out_ch,
     )
 
+    # TODO(czhu): the problem with EP is that these 2 elementwise are loading
+    # everything even the tokens that don't belong to this rank
+    
     activation_callable(act_out, mm1_out)
+
+    # if mm1_out.device.index == 1:
+    #     # validate first rows are nonzero, then zero
+    #     row_is_zero = (mm1_out == 0).all(dim=1)
+    #     zero_indices = row_is_zero.nonzero(as_tuple=True)[0]
+    #     k = zero_indices[0].item() if len(zero_indices) else None
+    #     valid = (row_is_zero[k:].all().item() if k is not None else False)
+    #     print(f"[conway-log] after activation {mm1_out.shape=}, {k=}, {valid=}")
 
     a2q, a2q_scale = ops.scaled_fp8_quant(
         act_out, a2_scale, use_per_token_if_dynamic=per_act_token, output=quant_out
     )
 
+    # TODO(czhu): can we avoid doing this or make it faster? looks like taking 140µs
+    # for EP4 8k prefill C5 133B
     if expert_map is not None:
         mm2_out.fill_(0)
 
@@ -233,6 +270,14 @@ def run_cutlass_moe_fp8(
         per_out_ch,
     )
 
+    # if output.device.index == 0:
+    #     # first dim is topk * M
+    #     # this stuff 0 if we didnt init fp8 properly
+    #     # it seems these 2 only nonzero for first local_experts rows?
+    #     # print(f"[conway-log] {mm2_out=}") 
+    #     # print(f"[conway-log] {a2q=}")
+    #     print(f"[conway-log] {topk_weights=}, {topk_weights.shape=}")
+
     if use_batched_format:
         output.copy_(mm2_out.reshape(local_E, padded_M, K), non_blocking=True)
     else:
@@ -244,6 +289,8 @@ def run_cutlass_moe_fp8(
             topk_weights=topk_weights,
             inv_permuted_idx=inv_perm,
         )
+    # if output.device.index == 0:
+    #     print(f"[conway-log] {output.shape=}")
 
 
 class CutlassExpertsFp8Base(mk.FusedMoEPermuteExpertsUnpermute):

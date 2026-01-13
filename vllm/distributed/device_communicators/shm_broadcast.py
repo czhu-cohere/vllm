@@ -539,9 +539,10 @@ class MessageQueue:
                     if not indefinite and (
                         elapsed > VLLM_RINGBUFFER_WARNING_INTERVAL * n_warning
                     ):
-                        logger.info(
-                            long_wait_time_msg(VLLM_RINGBUFFER_WARNING_INTERVAL)
-                        )
+                        # TODO(czhu): just disabled for debugging
+                        # logger.info(
+                        #     long_wait_time_msg(VLLM_RINGBUFFER_WARNING_INTERVAL)
+                        # )
                         n_warning += 1
 
                     continue

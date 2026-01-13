@@ -1089,6 +1089,8 @@ def initialize_dummy_weights(
                 # uniform_ doesn't support < 16-bit datatypes (FP8)
                 dtype = param.data.dtype
                 tmp_param = param.data.to(torch.float16)
+                # TODO(czhu) just change this so fp8 doesnt squash to 0
+                low, high = -1, 1
                 tmp_param = tmp_param.uniform_(low, high, generator=generator).to(dtype)
                 param.data.copy_(tmp_param)
             else:
