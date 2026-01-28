@@ -38,16 +38,17 @@ from vllm.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
+from vllm.distributed.device_communicators.tk_comm import TKCommunicator
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
 # Default sequence lengths to benchmark
-DEFAULT_SEQUENCE_LENGTHS = [128, 512, 1024, 2048, 4096, 8192]
+DEFAULT_SEQUENCE_LENGTHS = [1, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 
 # Fixed hidden size and dtype for all benchmarks
-HIDDEN_SIZE = 8192
+HIDDEN_SIZE = 4096 # C5
 BENCHMARK_DTYPE = torch.bfloat16
 
 # CUDA graph settings
@@ -74,6 +75,8 @@ class CommunicatorBenchmark:
         max_seq_len = max(sequence_lengths)
         max_tensor_elements = max_seq_len * HIDDEN_SIZE
         self.max_size_override = max_tensor_elements * BENCHMARK_DTYPE.itemsize + 1
+        self.sequence_lengths = sequence_lengths
+        self.hidden_size = HIDDEN_SIZE
 
         # Initialize communicators
         self.custom_allreduce = None
@@ -81,6 +84,7 @@ class CommunicatorBenchmark:
         self.symm_mem_comm = None
         self.symm_mem_comm_multimem = None
         self.symm_mem_comm_two_shot = None
+        self.tk_comm = None
 
         self._init_communicators()
 
@@ -160,6 +164,21 @@ class CommunicatorBenchmark:
                 e,
             )
             self.symm_mem_comm_two_shot = None
+        
+        # thunderkittens
+        try:
+            self.tk_comm = TKCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+                max_size_override=self.max_size_override,
+                sequence_lengths=self.sequence_lengths,
+                hidden_size=self.hidden_size,
+            )
+            if self.tk_comm.disabled:
+                self.tk_comm = None
+        except Exception as e:
+            logger.warning("Rank %s: Failed to initialize TKCommunicator: %s", self.rank, e)
+            self.tk_comm = None
 
     def benchmark_allreduce(
         self, sequence_length: int, num_warmup: int, num_trials: int
@@ -239,6 +258,27 @@ class CommunicatorBenchmark:
                 )
             )
 
+        if self.tk_comm is not None:
+            comm = self.tk_comm
+            communicators.append(
+                (
+                    "tk",
+                    lambda t, c=comm: c.all_reduce(t),
+                    lambda t, c=comm: True,
+                    nullcontext(),  # TK probably can’t be captured by CUDA graph initially
+                    None,
+                )
+            )
+            communicators.append(
+                (
+                    "tk_no_copy",
+                    lambda t, c=comm: c.all_reduce(t, copy=False),
+                    lambda t, c=comm: True,
+                    nullcontext(),  # TK probably can’t be captured by CUDA graph initially
+                    None,
+                )
+            )
+
         # Benchmark each communicator
         for name, allreduce_fn, should_use_fn, context, env_var in communicators:
             # Set environment variable if needed
@@ -293,7 +333,7 @@ class CommunicatorBenchmark:
                     graph = torch.cuda.CUDAGraph()
                     graph_pool = torch.cuda.graph_pool_handle()
                     set_graph_pool_id(graph_pool)
-                    with torch.cuda.graph(graph, pool=graph_pool, stream=stream):
+                    with torch.cuda.graph(graph, pool=graph_pool):
                         for _ in range(CUDA_GRAPH_CAPTURE_CYCLES):
                             allreduce_fn(graph_input)
 
@@ -426,7 +466,8 @@ def main():
 
     # Initialize distributed
     if not dist.is_initialized():
-        dist.init_process_group(backend="gloo")
+        # for tk need nccl; this works
+        dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
